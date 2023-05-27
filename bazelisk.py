@@ -17,7 +17,6 @@ limitations under the License.
 
 import base64
 from contextlib import closing
-from distutils.version import LooseVersion
 import hashlib
 import json
 import netrc
@@ -98,6 +97,8 @@ def find_workspace_root(root=None):
         root = os.getcwd()
     if os.path.exists(os.path.join(root, "WORKSPACE")):
         return root
+    if os.path.exists(os.path.join(root, "WORKSPACE.bazel")):
+        return root
     new_root = os.path.dirname(root)
     return find_workspace_root(new_root) if new_root != root else None
 
@@ -171,15 +172,18 @@ def read_remote_text_file(url):
 
 
 def get_version_history(bazelisk_directory):
-    ordered = sorted(
+    return sorted(
         (
-            LooseVersion(release["tag_name"])
+            release["tag_name"]
             for release in get_releases_json(bazelisk_directory)
             if not release["prerelease"]
         ),
+        # This only handles versions with numeric components, but that is fine
+        # since prerelease versions have been excluded.
+        key=lambda version: tuple(int(component)
+                                  for component in version.split('.')),
         reverse=True,
     )
-    return [str(v) for v in ordered]
 
 
 def resolve_latest_version(version_history, offset):
@@ -256,6 +260,8 @@ def normalized_machine_arch_name():
     machine = platform.machine().lower()
     if machine == "amd64":
         machine = "x86_64"
+    elif machine == "aarch64":
+        machine = "arm64"
     return machine
 
 

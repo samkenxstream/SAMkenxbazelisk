@@ -166,7 +166,7 @@ func TestResolveLatestVersion_ShouldFailIfNotEnoughReleases(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expected ResolveVersion() to fail.")
 	}
-	expectedError := "unable to determine latest version: requested 2 latest releases, but only found 1"
+	expectedError := "cannot resolve version \"latest-1\": There are not enough matching Bazel releases (1)"
 	if err.Error() != expectedError {
 		t.Fatalf("Expected error message %q, but got '%v'", expectedError, err)
 	}
@@ -201,7 +201,7 @@ func TestResolveLatestVersion_GitHubIsDown(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expected resolveLatestVersion() to fail.")
 	}
-	expectedPrefix := "unable to determine latest version: unable to dermine 'some_fork' releases: could not download list of Bazel releases from github.com/some_fork"
+	expectedPrefix := "unable to determine latest version: unable to determine 'some_fork' releases: could not download list of Bazel releases from github.com/some_fork"
 	if !strings.HasPrefix(err.Error(), expectedPrefix) {
 		t.Fatalf("Expected error message that starts with %q, but got '%v'", expectedPrefix, err)
 	}

@@ -13,15 +13,36 @@ import (
 const (
 	// BaseURLEnv is the name of the environment variable that stores the base URL for downloads.
 	BaseURLEnv = "BAZELISK_BASE_URL"
+
+	// FormatURLEnv is the name of the environment variable that stores the format string to generate URLs for downloads.
+	FormatURLEnv = "BAZELISK_FORMAT_URL"
 )
 
 // DownloadFunc downloads a specific Bazel binary to the given location and returns the absolute path.
 type DownloadFunc func(destDir, destFile string) (string, error)
 
+// ReleaseFilter filters Bazel versions based on specific criteria.
+type ReleaseFilter func(matchesSoFar int, currentVersion string) bool
+
+func lastNReleases(max int) ReleaseFilter {
+	return func(matchesSoFar int, currentVersion string) bool {
+		return max < 1 || matchesSoFar < max
+	}
+}
+
+// filterReleasesByTrack only works reliably if iterating on Bazel versions in descending order.
+func filterReleasesByTrack(track int) ReleaseFilter {
+	prefix := fmt.Sprintf("%d.", track)
+	return func(matchesSoFar int, currentVersion string) bool {
+		return matchesSoFar == 0 && strings.HasPrefix(currentVersion, prefix)
+	}
+}
+
 // ReleaseRepo represents a repository that stores LTS Bazel releases.
 type ReleaseRepo interface {
-	// GetReleaseVersions returns a list of all available release versions. If lastN is smaller than 1, all available versions are being returned.
-	GetReleaseVersions(bazeliskHome string, lastN int) ([]string, error)
+	// GetReleaseVersions returns a list of all available release versions that match the given filter function.
+	// Warning: the filter only works reliably if the versions are processed in descending order!
+	GetReleaseVersions(bazeliskHome string, filter ReleaseFilter) ([]string, error)
 
 	// DownloadRelease downloads the given Bazel version into the specified location and returns the absolute path.
 	DownloadRelease(version, destDir, destFile string) (string, error)
@@ -117,13 +138,15 @@ func (r *Repositories) resolveFork(bazeliskHome string, vi *versions.Info) (stri
 
 func (r *Repositories) resolveRelease(bazeliskHome string, vi *versions.Info) (string, DownloadFunc, error) {
 	lister := func(bazeliskHome string) ([]string, error) {
-		var lastN int
-		// Optimization: only fetch last (x+1) releases if the version is "latest-x".
-		// This does not work if the version is "4.x", i.e. if TrackRestriction is set.
-		if vi.TrackRestriction == 0 {
-			lastN = vi.LatestOffset + 1
+		var filter ReleaseFilter
+		if vi.TrackRestriction > 0 {
+			// Optimization: only fetch matching releases if an LTS track is specified.
+			filter = filterReleasesByTrack(vi.TrackRestriction)
+		} else {
+			// Optimization: only fetch last (x+1) releases if the version is "latest-x".
+			filter = lastNReleases(vi.LatestOffset + 1)
 		}
-		return r.Releases.GetReleaseVersions(bazeliskHome, lastN)
+		return r.Releases.GetReleaseVersions(bazeliskHome, filter)
 	}
 	version, err := resolvePotentiallyRelativeVersion(bazeliskHome, lister, vi)
 	if err != nil {
@@ -187,27 +210,12 @@ func resolvePotentiallyRelativeVersion(bazeliskHome string, lister listVersionsF
 		return "", fmt.Errorf("unable to determine latest version: %v", err)
 	}
 
-	if vi.TrackRestriction > 0 {
-		available = restrictToTrack(available, vi.TrackRestriction)
-	}
-
 	index := len(available) - 1 - vi.LatestOffset
 	if index < 0 {
-		return "", fmt.Errorf("cannot resolve version \"%s\": There are only %d Bazel versions", vi.Value, len(available))
+		return "", fmt.Errorf("cannot resolve version \"%s\": There are not enough matching Bazel releases (%d)", vi.Value, len(available))
 	}
 	sorted := versions.GetInAscendingOrder(available)
 	return sorted[index], nil
-}
-
-func restrictToTrack(versions []string, track int) []string {
-	filtered := make([]string, 0)
-	prefix := fmt.Sprintf("%d.", track)
-	for _, v := range versions {
-		if strings.HasPrefix(v, prefix) {
-			filtered = append(filtered, v)
-		}
-	}
-	return filtered
 }
 
 // DownloadFromBaseURL can download Bazel binaries from a specific URL while ignoring the predefined repositories.
@@ -224,6 +232,65 @@ func (r *Repositories) DownloadFromBaseURL(baseURL, version, destDir, destFile s
 	}
 
 	url := fmt.Sprintf("%s/%s/%s", baseURL, version, srcFile)
+	return httputil.DownloadBinary(url, destDir, destFile)
+}
+
+func BuildURLFromFormat(formatURL, version string) (string, error) {
+	osName, err := platforms.DetermineOperatingSystem()
+	if err != nil {
+		return "", err
+	}
+
+	machineName, err := platforms.DetermineArchitecture(osName, version)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	b.Grow(len(formatURL) * 2) // Approximation.
+	for i := 0; i < len(formatURL); i++ {
+		ch := formatURL[i]
+		if ch == '%' {
+			i++
+			if i == len(formatURL) {
+				return "", errors.New("trailing %")
+			}
+
+			ch = formatURL[i]
+			switch ch {
+			case 'e':
+				b.WriteString(platforms.DetermineExecutableFilenameSuffix())
+			case 'h':
+				b.WriteString(GetEnvOrConfig("BAZELISK_VERIFY_SHA256"))
+			case 'm':
+				b.WriteString(machineName)
+			case 'o':
+				b.WriteString(osName)
+			case 'v':
+				b.WriteString(version)
+			case '%':
+				b.WriteByte('%')
+			default:
+				return "", fmt.Errorf("unknown placeholder %%%c", ch)
+			}
+		} else {
+			b.WriteByte(ch)
+		}
+	}
+	return b.String(), nil
+}
+
+// DownloadFromFormatURL can download Bazel binaries from a specific URL while ignoring the predefined repositories.
+func (r *Repositories) DownloadFromFormatURL(formatURL, version, destDir, destFile string) (string, error) {
+	if formatURL == "" {
+		return "", fmt.Errorf("%s is not set", FormatURLEnv)
+	}
+
+	url, err := BuildURLFromFormat(formatURL, version)
+	if err != nil {
+		return "", err
+	}
+
 	return httputil.DownloadBinary(url, destDir, destFile)
 }
 
@@ -271,7 +338,7 @@ type noReleaseRepo struct {
 	err error
 }
 
-func (nrr *noReleaseRepo) GetReleaseVersions(bazeliskHome string, lastN int) ([]string, error) {
+func (nrr *noReleaseRepo) GetReleaseVersions(bazeliskHome string, filter ReleaseFilter) ([]string, error) {
 	return nil, nrr.err
 }
 
